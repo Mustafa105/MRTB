@@ -526,13 +526,15 @@ if st.session_state.run_agents:
             impact_df[["Feature label", "SHAP contribution", "Absolute contribution"]],
             use_container_width=True,
             hide_index=True,
-        )
+        ) 
 
-  st.info(
-    "Validation reminder: this application uses synthetic data and illustrative rules. "
-    "It is not an official Lidl tool, does not connect to Lidl systems, and does not execute actions. "
-    "Validate models and operational policies with authorized real data before any business use."
-)
+
+
+      st.info(
+        "Validation reminder: this application uses synthetic data and illustrative rules. "
+        "It is not an official Lidl tool, does not connect to Lidl systems, and does not execute actions. "
+        "Validate models and operational policies with authorized real data before any business use."
+    )
 
 
 # Demo scenarios. Replace with real monitored events when available.
