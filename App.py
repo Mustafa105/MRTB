@@ -532,4 +532,224 @@ if st.session_state.run_agents:
         "Validation reminder: this application uses synthetic data and illustrative rules. "
         "It is not an official Lidl tool, does not connect to Lidl systems, and does not execute actions. "
         "Validate models and operational policies with authorized real data before any business use."
+
+        
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# Demo scenarios. Replace with real monitored events when available.
+SCENARIOS = [
+    {
+        "id": "COMP-001",
+        "title": "Competitor increases its price",
+        "description": "A competitor's observed price increases to €2.00.",
+        "competitor_price": 2.00,
+        "competitor_promo": 0,
+    },
+    {
+        "id": "COMP-002",
+        "title": "Competitor launches a promotion",
+        "description": "A competitor starts a promotional campaign.",
+        "competitor_price": 1.49,
+        "competitor_promo": 1,
+    },
+    {
+        "id": "COMP-003",
+        "title": "Competitor cuts its price",
+        "description": "A competitor's observed price falls to €1.20.",
+        "competitor_price": 1.20,
+        "competitor_promo": 0,
+    },
+]
+
+if "scenario_index" not in st.session_state:
+    st.session_state.scenario_index = 0
+
+if "pending_scenario" not in st.session_state:
+    st.session_state.pending_scenario = None
+
+if "decision_log" not in st.session_state:
+    st.session_state.decision_log = []
+
+if "last_scenario_id" not in st.session_state:
+    st.session_state.last_scenario_id = None
+
+
+def calculate_option(price, scenario):
+    """Predict demand and basic economics for one price option."""
+    row = input_row.copy()
+
+    row.loc[0, "Price_Euro"] = price
+    row.loc[0, "Competitor_Price_Euro"] = (
+        scenario["competitor_price"]
+    )
+    row.loc[0, "Competitor_Promo"] = (
+        scenario["competitor_promo"]
+    )
+
+    predicted_units = max(
+        0, int(round(float(model.predict(row)[0])))
+    )
+
+    revenue = predicted_units * price
+    gross_profit = predicted_units * (price - unit_cost)
+
+    return {
+        "price": price,
+        "units": predicted_units,
+        "revenue": revenue,
+        "gross_profit": gross_profit,
+    }
+
+
+def make_scenario_comparison(scenario):
+    """Compare candidate actions against the current price."""
+    candidate_prices = {
+        "Raise price by 5%": round(s_price * 1.05, 2),
+        "Keep current price": round(s_price, 2),
+        "Lower price by 5%": round(s_price * 0.95, 2),
+    }
+
+    rows = []
+    for action, price in candidate_prices.items():
+        result = calculate_option(price, scenario)
+        result["Action"] = action
+        rows.append(result)
+
+    return pd.DataFrame(rows)
+
+
+@st.dialog("Retail decision required", width="large")
+def show_scenario_dialog(scenario):
+    st.warning("SIMULATED EVENT — not a verified live competitor update")
+
+    st.subheader(scenario["title"])
+    st.write(scenario["description"])
+    st.write(f"Category: **{selected_cat}**")
+    st.write(
+        f"Scenario competitor price: "
+        f"**€{scenario['competitor_price']:.2f}**"
+    )
+
+    comparison = make_scenario_comparison(scenario)
+
+    st.markdown("### Predicted impact of each option")
+    st.dataframe(
+        comparison[
+            ["Action", "price", "units", "revenue", "gross_profit"]
+        ].rename(columns={
+            "price": "Lidl price (€)",
+            "units": "Forecast units",
+            "revenue": "Revenue (€)",
+            "gross_profit": "Gross profit (€)",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "Estimates use the current predictive model. "
+        "They are not causal estimates or guaranteed outcomes."
+    )
+
+    best_index = int(
+        comparison["gross_profit"].to_numpy().argmax()
+    )
+    suggested_action = comparison.iloc[best_index]["Action"]
+
+    st.info(
+        f"Candidate with the highest modeled gross profit: "
+        f"**{suggested_action}**. "
+        "Check pricing rules and uncertainty before approving."
+    )
+
+    st.markdown("### What should the manager do?")
+
+    for _, option in comparison.iterrows():
+        if st.button(
+            f"Select: {option['Action']}",
+            key=f"decision_{scenario['id']}_{option['Action']}",
+            use_container_width=True,
+        ):
+            st.session_state.decision_log.append({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "scenario": scenario["title"],
+                "scenario_id": scenario["id"],
+                "action": option["Action"],
+                "proposed_price": float(option["price"]),
+                "predicted_units": int(option["units"]),
+                "predicted_revenue": float(option["revenue"]),
+                "predicted_gross_profit": float(
+                    option["gross_profit"]
+                ),
+                "status": "Selected for review; not executed",
+            })
+            st.session_state.pending_scenario = None
+            st.rerun()
+
+    if st.button(
+        "Defer decision",
+        key=f"defer_{scenario['id']}",
+        use_container_width=True,
+    ):
+        st.session_state.decision_log.append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "scenario": scenario["title"],
+            "scenario_id": scenario["id"],
+            "action": "Deferred",
+            "proposed_price": None,
+            "predicted_units": None,
+            "predicted_revenue": None,
+            "predicted_gross_profit": None,
+            "status": "Awaiting manager review",
+        })
+        st.session_state.pending_scenario = None
+        st.rerun()
+
+
+@st.fragment(run_every="30s")
+def scenario_monitor():
+    st.subheader("Autonomous Scenario Monitor")
+
+    if st.session_state.pending_scenario is None:
+        scenario = SCENARIOS[
+            st.session_state.scenario_index % len(SCENARIOS)
+        ]
+
+        st.session_state.scenario_index += 1
+        st.session_state.pending_scenario = scenario
+        st.session_state.last_scenario_id = scenario["id"]
+
+    pending = st.session_state.pending_scenario
+
+    st.warning(
+        f"New scenario awaiting review: {pending['title']}"
+    )
+
+    if st.button(
+        "Review scenario and take action",
+        key="review_scenario",
+        type="primary",
+    ):
+        show_scenario_dialog(pending)
+
+    # Also open the dialog automatically when a scenario is pending.
+    # The dialog remains available after the timed fragment reruns.
+    show_scenario_dialog(pending)
+
+
+scenario_monitor()
+
+st.subheader("Manager decision history")
+if st.session_state.decision_log:
+    st.dataframe(
+        pd.DataFrame(st.session_state.decision_log),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.caption("No manager decisions have been recorded yet.")
+
     )
