@@ -533,11 +533,7 @@ if st.session_state.run_agents:
         "It is not an official Lidl tool, does not connect to Lidl systems, and does not execute actions. "
         "Validate models and operational policies with authorized real data before any business use."
 
-        
-import streamlit as st
-import pandas as pd
-import numpy as np
-from datetime import datetime
+
 
 # Demo scenarios. Replace with real monitored events when available.
 SCENARIOS = [
