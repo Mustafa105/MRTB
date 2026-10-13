@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("💛 💙 Lidl Store Operations — Nine-Agent Decision Support MVP")
+st.title(" Lidl Store Operations — Nine-Agent Decision Support MVP")
 st.caption(
     "Demonstration only: synthetic data, illustrative coefficients, and simulated recommendations. "
     "No orders, price changes, staff changes, or compliance actions are executed."
