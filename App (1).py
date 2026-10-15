@@ -25,7 +25,7 @@ except Exception:
     shap = None
     SHAP_AVAILABLE = False
 
-st.set_page_config(page_title="Retail Multi-Agent Store Operations MVP (Retail Brain)", page_icon="🛒", layout="wide")
+st.set_page_config(page_title="Retail Multi-Agent Store Operations MVP (Retail Brain)", layout="wide")
 
 # -----------------------------------------------------------------------------
 # Configuration and scenario templates
