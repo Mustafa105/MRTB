@@ -1293,3 +1293,118 @@ with tab_model:
 # Footer
 st.divider()
 st.caption("Prototype limitations: synthetic data only; no real retailer feeds, orders, pricing, staffing, or compliance actions. Decisions, manager notes, and scenarios are held in the current Streamlit session and are not persisted to a database. Forecasts are exploratory and require validation before operational use.")
+
+
+
+            return "\n".join(lines)
+        if any(term in q for term in ["what if", "what-if", "increase price", "raise price", "pricing", "price increase"]):
+            return ("For a useful what-if, specify a category and change, for example: **‘What if I increase Ortofrutta price by 5%?’** "
+                    "I can explain the price gap and likely trade-offs now. For numerical recalculation of demand, profit, stockouts and waste, open **Trial & error lab**, select the category, change the relevant parameter, and compare the baseline with the trial.")
+        if any(term in q for term in ["agent", "nine-agent", "9-agent", "what does"]):
+            return ("The dashboard organizes the simulated workflow into nine operational roles: **demand forecasting, inventory risk, commercial intelligence, replenishment, freshness/waste, workforce planning, promotion/display, profitability, and compliance/task management**. "
+                    "They are decision-support views in this prototype, not nine independent live AI systems. Ask about a category or metric to inspect its current simulated values.")
+        return ("I can help interpret the current dashboard, category metrics, scenarios, decision history, pricing trade-offs, inventory, replenishment, waste, staffing, and competition. "
+                "Try asking **‘Summarize the dashboard’**, **‘What is the stockout risk for Ortofrutta?’**, **‘Review previous decisions’**, or **‘What if I increase Birra price by 5%?’**\n\n"
+                "This built-in assistant works without a key and uses the current session's synthetic data. For complex what-if calculations, use **Trial & error lab** so the app's estimator recalculates the numbers.")
+
+    # Clear stale API-key prompts left in Streamlit session state by older app versions.
+    _legacy_key_prompt_fragments = (
+        "enter your selected provider's api key",
+        "enter your selected provider’s api key",
+        "configure it in streamlit secrets as openai_api_key",
+        "to start the ai conversation",
+    )
+    if "manager_ai_messages" not in st.session_state:
+        st.session_state.manager_ai_messages = [{"role": "assistant", "content": "Hello! I'm Retail Brain's built-in manager assistant. I'm ready to help—no API key or setup needed. Try ‘Summarize the dashboard’ or ask a category-specific what-if question."}]
+    else:
+        st.session_state.manager_ai_messages = [
+            msg for msg in st.session_state.manager_ai_messages
+            if not any(fragment in str(msg.get("content", "")).lower() for fragment in _legacy_key_prompt_fragments)
+        ]
+        if not st.session_state.manager_ai_messages:
+            st.session_state.manager_ai_messages = [{"role": "assistant", "content": "Hello! I'm Retail Brain's built-in manager assistant. I'm ready to help—no API key or setup needed. Try ‘Summarize the dashboard’ or ask a category-specific what-if question."}]
+    control_col, _ = st.columns([1, 4])
+    with control_col:
+        if st.button("🗑️ Clear chat", key="clear_manager_ai_chat"):
+            st.session_state.manager_ai_messages = []
+            st.rerun()
+
+    for msg in st.session_state.manager_ai_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_prompt = st.chat_input("Ask about a decision, scenario, or what-if…", key="manager_ai_chat_input")
+    if user_prompt:
+        st.session_state.manager_ai_messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        try:
+            assistant_reply = _local_manager_answer(user_prompt, _assistant_context())
+        except Exception as exc:
+            assistant_reply = ("I couldn't fully read the current session metrics. You can still ask general Retail Brain questions, "
+                               f"or try again after the dashboard refreshes. Technical detail: {exc}")
+        st.session_state.manager_ai_messages.append({"role": "assistant", "content": assistant_reply})
+        with st.chat_message("assistant"):
+            st.markdown(assistant_reply)
+
+    with st.expander("About this assistant"):
+        st.markdown(
+            "- Ready to use immediately: no API key, provider selection, or settings required.\n"
+            "- It reads the current session's synthetic profiles, metrics, scenarios, and decision history.\n"
+            "- It is a built-in context-aware assistant, not a connection to ChatGPT or Gemini. Its what-if explanations are guidance; use Trial & error lab for numerical recalculation.\n"
+            "- All figures are simulated and should not be treated as verified real-world outcomes."
+        )
+
+with tab_model:
+    st.subheader("Model explainability and feature contributions")
+    model, model_description = get_model()
+    st.write(f"**Demand estimator:** {model_description}")
+    st.caption("The model is trained on generated synthetic examples. Feature importance describes this prototype's fitted model and must not be interpreted as a validated real-world causal explanation.")
+    X_train, y_train = make_training_data()
+    if XGBOOST_AVAILABLE and hasattr(model, "feature_importances_"):
+        importance = pd.DataFrame({"Feature": FEATURES, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
+    else:
+        # Transparent proxy importance ranking for fallback mode.
+        proxy = {"price": .18, "competitor_price": .09, "promo_pct": .13, "display_pct": .08,
+                 "temperature": .04, "traffic_idx": .17, "stock_units": .12, "lead_time_days": .04,
+                 "expiry_days": .04, "staffing_units": .05, "unit_cost": .01, "category_factor": .05}
+        importance = pd.DataFrame({"Feature": list(proxy), "Importance": list(proxy.values())}).sort_values("Importance", ascending=False)
+    importance["Feature label"] = importance["Feature"].map(FEATURE_LABELS)
+    try:
+        import altair as alt
+        importance_chart = alt.Chart(importance).mark_bar().encode(
+            x=alt.X("Importance:Q", title="Relative importance"),
+            y=alt.Y("Feature label:N", sort="-x", title="Feature", axis=alt.Axis(labelAngle=0)),
+            tooltip=["Feature label", "Importance"],
+        )
+        st.altair_chart(importance_chart, use_container_width=True)
+    except Exception:
+        st.dataframe(importance[["Feature label", "Importance"]].round(4), use_container_width=True, hide_index=True)
+    st.dataframe(importance[["Feature label", "Importance"]].round(4), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Local feature contribution proxy")
+    selected_explain_category = st.selectbox("Category for explanation", list(CATEGORIES), key="explain_category")
+    explain_profile = current_profile(selected_explain_category)
+    baseline_profile = st.session_state.base_profiles[selected_explain_category]
+    contributions = []
+    for feature in FEATURES:
+        current_value = float(explain_profile[feature])
+        baseline_value = float(baseline_profile[feature])
+        delta = current_value - baseline_value
+        # Explicit directional heuristic, clearly labeled as a proxy, not SHAP.
+        direction = -1 if feature in ("price", "lead_time_days") else 1
+        if feature == "competitor_price": direction = 1
+        proxy_contribution = delta * direction
+        contributions.append({"Feature": feature, "Feature label": FEATURE_LABELS[feature],
+                              "Current value": round(current_value, 3), "Baseline value": round(baseline_value, 3),
+                              "Input delta": round(delta, 3), "Directional contribution proxy": round(proxy_contribution, 3)})
+    impact_df = pd.DataFrame(contributions)
+    impact_df["Absolute contribution proxy"] = impact_df["Directional contribution proxy"].abs()
+    impact_df = impact_df.sort_values("Absolute contribution proxy", ascending=False)
+    st.dataframe(impact_df[["Feature label", "Current value", "Baseline value", "Input delta", "Directional contribution proxy", "Absolute contribution proxy"]],
+                 use_container_width=True, hide_index=True)
+    st.caption("SHAP is optional and installed if available, but this screen deliberately labels the local table as a directional heuristic. It is not a SHAP explanation. For rigorous SHAP values, validate the model, background data, and explainer configuration before use.")
+
+# Footer
+st.divider()
+st.caption("Prototype limitations: synthetic data only; no real retailer feeds, orders, pricing, staffing, or compliance actions. Decisions, manager notes, and scenarios are held in the current Streamlit session and are not persisted to a database. Forecasts are exploratory and require validation before operational use.")
