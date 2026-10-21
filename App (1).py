@@ -5,6 +5,7 @@ import re
 import random
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,56 @@ except Exception:
     SHAP_AVAILABLE = False
 
 st.set_page_config(page_title="Retail Multi-Agent Store Operations MVP (Retail Brain)", page_icon="🛒", layout="wide")
+
+# -----------------------------------------------------------------------------
+# Lightweight file-based persistence
+# -----------------------------------------------------------------------------
+# This is intentionally simple: an append-only JSONL log written next to the
+# app, not a managed database. On a platform with ephemeral storage (for
+# example, a redeploy on Streamlit Community Cloud) this file can still be
+# wiped, so it is a genuine improvement over session-only state (decisions
+# now survive a page refresh or a second browser tab against the same running
+# instance) but it is not a durable, multi-instance database. The app says so
+# explicitly in its footer rather than implying otherwise.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+HISTORY_FILE = DATA_DIR / "decision_history.jsonl"
+PERSISTENCE_AVAILABLE = True
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    PERSISTENCE_AVAILABLE = False
+
+
+def persist_decision_record(record: dict[str, Any]) -> bool:
+    """Append one decision record to the local audit-trail file. Never raises."""
+    if not PERSISTENCE_AVAILABLE:
+        return False
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def load_persisted_history() -> list[dict[str, Any]]:
+    """Read previously persisted decision records, oldest first. Never raises."""
+    if not PERSISTENCE_AVAILABLE or not HISTORY_FILE.exists():
+        return []
+    records = []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return records
 
 # Keep explanatory captions and secondary labels readable in both Streamlit themes.
 # Use Streamlit's theme text variable so auto/light/dark themes are respected.
@@ -155,10 +206,26 @@ def init_state() -> None:
         "auto_monitor": False, "sound_enabled": False,
         "scan_count": 0, "model_error": None,
         "last_review_event_id": None,
+        "history_loaded_from_disk": False,
+        "last_persist_ok": True,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Merge any decisions persisted by this or an earlier session on this
+    # deployment instance, once per session, so the audit trail outlives a
+    # single browser session rather than resetting on every refresh.
+    if not st.session_state.history_loaded_from_disk:
+        persisted = load_persisted_history()
+        if persisted:
+            existing_keys = {(r.get("event_id"), r.get("decision_at")) for r in st.session_state.decision_history}
+            for record in persisted:
+                key = (record.get("event_id"), record.get("decision_at"))
+                if key not in existing_keys:
+                    st.session_state.decision_history.append(record)
+                    existing_keys.add(key)
+            st.session_state.decision_history.sort(key=lambda r: r.get("decision_at") or "", reverse=True)
+        st.session_state.history_loaded_from_disk = True
 
 init_state()
 
@@ -302,6 +369,63 @@ def predict_demand(profile: dict[str, Any]) -> float:
     except Exception:
         fallback = LinearFallback()
         return max(0.0, float(fallback.predict(row)[0]))
+
+
+# -----------------------------------------------------------------------------
+# Explainability — real SHAP values for the trained XGBoost model
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_shap_explainer():
+    """Build a TreeExplainer against the trained model's own training data.
+
+    Returns (explainer, background_frame) or (None, None) if SHAP or a
+    tree-based model are unavailable. TreeExplainer only applies to the
+    XGBoost model; the transparent-formula fallback has no SHAP explainer
+    because it is not a learned model, and its logic is already fully
+    readable in LinearFallback.predict above.
+    """
+    if not SHAP_AVAILABLE:
+        return None, None
+    model, description = get_model()
+    if "XGBoost" not in description:
+        return None, None
+    try:
+        X_train, _ = make_training_data()
+        explainer = shap.TreeExplainer(model)
+        return explainer, X_train
+    except Exception:
+        return None, None
+
+
+def compute_shap_contributions(profile: dict[str, Any]) -> pd.DataFrame | None:
+    """Real per-feature SHAP contributions for one profile's demand prediction.
+
+    Returns None (never raises) when a tree explainer is unavailable, so
+    callers can fall back to the labeled heuristic instead.
+    """
+    explainer, _ = get_shap_explainer()
+    if explainer is None:
+        return None
+    row = pd.DataFrame([{key: float(profile[key]) for key in FEATURES}])[FEATURES]
+    try:
+        shap_values = explainer.shap_values(row)
+        base_value = explainer.expected_value
+        if isinstance(base_value, (list, np.ndarray)):
+            base_value = float(np.ravel(base_value)[0])
+        values = np.ravel(shap_values)
+        out = pd.DataFrame({
+            "Feature": FEATURES,
+            "Feature label": [FEATURE_LABELS[f] for f in FEATURES],
+            "Value": [float(row.iloc[0][f]) for f in FEATURES],
+            "SHAP contribution (units/day)": values,
+        })
+        out["Absolute contribution"] = out["SHAP contribution (units/day)"].abs()
+        out = out.sort_values("Absolute contribution", ascending=False).reset_index(drop=True)
+        out.attrs["base_value"] = float(base_value)
+        out.attrs["prediction"] = float(base_value) + float(values.sum())
+        return out
+    except Exception:
+        return None
 
 
 def calculate_metrics(category: str, profile: dict[str, Any]) -> dict[str, float | str]:
@@ -456,6 +580,44 @@ def find_relevant_cases(event: dict[str, Any], limit: int = 3) -> list[dict[str,
     return sorted(cases, key=lambda x: x["similarity"], reverse=True)[:limit]
 
 
+def compute_agreement_stats(history: list[dict[str, Any]]) -> dict[str, Any]:
+    """Trust-calibration proxy: how often the manager agrees with a generated scenario.
+
+    Every scenario the system raises is, implicitly, a candidate recommendation
+    for the manager to act on. Treating an approval as agreement and a
+    rejection as disagreement (deferrals are excluded as undecided) gives a
+    simple, auditable proxy for Trust in AI / Decision Confidence, the
+    constructs the conceptual model in the thesis is built around. This is a
+    descriptive proxy computed from recorded decisions, not a causal or
+    psychometric measure of trust.
+    """
+    decided = [h for h in history if h.get("decision") in ("approved", "rejected")]
+    if not decided:
+        return {"overall_rate": None, "n_decided": 0, "by_severity": pd.DataFrame(), "rolling": pd.DataFrame()}
+    approved = sum(1 for h in decided if h.get("decision") == "approved")
+    overall_rate = approved / len(decided)
+
+    by_sev_rows = []
+    for sev in ("Critical", "Warning", "Info"):
+        sev_decided = [h for h in decided if (h.get("severity") or "Info") == sev]
+        if sev_decided:
+            sev_approved = sum(1 for h in sev_decided if h.get("decision") == "approved")
+            by_sev_rows.append({"Severity": sev, "Decisions": len(sev_decided),
+                                "Agreement rate": sev_approved / len(sev_decided)})
+    by_severity = pd.DataFrame(by_sev_rows)
+
+    ordered = sorted(decided, key=lambda h: h.get("decision_at") or "")
+    cum_approved, rolling_rows = 0, []
+    for i, h in enumerate(ordered, start=1):
+        if h.get("decision") == "approved":
+            cum_approved += 1
+        rolling_rows.append({"Decision #": i, "Cumulative agreement rate": cum_approved / i})
+    rolling = pd.DataFrame(rolling_rows)
+
+    return {"overall_rate": overall_rate, "n_decided": len(decided), "n_approved": approved,
+            "by_severity": by_severity, "rolling": rolling}
+
+
 def record_decision(event: dict[str, Any], decision: str, note: str = "") -> None:
     event["status"] = decision
     event["decision_at"] = now_iso()
@@ -463,14 +625,17 @@ def record_decision(event: dict[str, Any], decision: str, note: str = "") -> Non
     if decision == "approved":
         if event["id"] not in st.session_state.approved_event_ids:
             st.session_state.approved_event_ids.append(event["id"])
-    st.session_state.decision_history.insert(0, {
+    record = {
         "event_id": event["id"], "created_at": event.get("created_at"),
         "decision_at": event["decision_at"], "template": event["template"],
         "category": event["category"], "variables": event["variables"],
         "decision": decision, "note": note.strip(),
         "delta_demand_units_at_review": event.get("delta_demand_units", 0),
         "delta_gross_profit_eur_at_review": event.get("delta_gross_profit_eur", 0),
-    })
+        "severity": event.get("severity", "Info"),
+    }
+    st.session_state.decision_history.insert(0, record)
+    st.session_state["last_persist_ok"] = persist_decision_record(record)
 
 
 def style_status_table(df: pd.DataFrame):
@@ -557,6 +722,41 @@ def fmt_eur(value: float) -> str:
 def fmt_num(value: float, digits: int = 1) -> str:
     return f"{value:,.{digits}f}"
 
+
+def render_shap_chart(shap_df: pd.DataFrame, key_prefix: str, top_n: int = 8) -> None:
+    """Render a signed horizontal bar chart of real SHAP contributions.
+
+    This is a genuine local explanation of the trained model's own
+    prediction (base value + sum of contributions = prediction), not the
+    directional heuristic used elsewhere as a fallback.
+    """
+    view = shap_df.head(top_n).copy()
+    base_value = shap_df.attrs.get("base_value")
+    prediction = shap_df.attrs.get("prediction")
+    if base_value is not None and prediction is not None:
+        st.caption(
+            f"Base rate (average predicted demand across training data): {base_value:.1f} units/day · "
+            f"This scenario's prediction: {prediction:.1f} units/day. "
+            f"The bars below show how each feature pushed the prediction away from the base rate."
+        )
+    try:
+        import altair as alt
+        chart = alt.Chart(view).mark_bar().encode(
+            x=alt.X("SHAP contribution (units/day):Q", title="SHAP contribution (units of demand/day)"),
+            y=alt.Y("Feature label:N", sort="-x", title="Feature", axis=alt.Axis(labelAngle=0)),
+            color=alt.condition(
+                alt.datum["SHAP contribution (units/day)"] > 0,
+                alt.value("#2E7D32"), alt.value("#B3261E"),
+            ),
+            tooltip=["Feature label", "Value", "SHAP contribution (units/day)"],
+        )
+        st.altair_chart(chart, use_container_width=True, key=f"{key_prefix}_shap_chart")
+    except Exception:
+        st.dataframe(view[["Feature label", "Value", "SHAP contribution (units/day)"]].round(3),
+                     use_container_width=True, hide_index=True)
+    st.caption("Green bars increase predicted demand relative to the base rate; red bars decrease it. "
+               "These are real SHAP values from the trained XGBoost model (TreeExplainer), not a heuristic.")
+
 # -----------------------------------------------------------------------------
 # Header, controls, and alerts
 # -----------------------------------------------------------------------------
@@ -564,7 +764,8 @@ st.title("Retail Multi-Agent Store Operations MVP (Retail Brain)")
 
 with st.sidebar:
     st.header("Control room")
-    st.write("**Simulation mode:** session-only state")
+    _sim_mode = "session state + local decision log" if PERSISTENCE_AVAILABLE else "session-only state"
+    st.write(f"**Simulation mode:** {_sim_mode}")
     if st.button("🔎 Scan for operational scenarios", use_container_width=True, type="primary"):
         scan_scenarios(3)
         st.rerun()
@@ -632,7 +833,7 @@ def review_dialog(event_id: str) -> None:
     st.caption(f"Created {event['created_at']} · Source: {event.get('source', 'Unknown')} · Severity: {event.get('severity', 'Info')}")
     st.write(event["description"])
     st.markdown(f"**Scenario changes:** {event['change_summary']}")
-    _, _, before, after = scenario_metrics(event["category"], event["changes"])
+    _, after_profile, before, after = scenario_metrics(event["category"], event["changes"])
     metrics = [
         ("Estimated daily demand", before["demand_units"], after["demand_units"], "units"),
         ("Estimated gross profit", before["gross_profit_eur"], after["gross_profit_eur"], "eur"),
@@ -650,6 +851,14 @@ def review_dialog(event_id: str) -> None:
         compare.append({"Metric": label, "Before": bs, "After if applied": ass, "Change": delta})
     st.dataframe(pd.DataFrame(compare), use_container_width=True, hide_index=True)
     st.caption("These are model-based projections against the current simulated profile, not measured outcomes or causal estimates.")
+
+    st.markdown("#### Why this projection — feature contributions")
+    shap_df = compute_shap_contributions(after_profile)
+    if shap_df is not None:
+        render_shap_chart(shap_df, key_prefix=f"review_{event_id}")
+    else:
+        st.info("A tree-based SHAP explanation is not available for this run (XGBoost/SHAP not active, or the fallback formula model is in use). "
+                "The fallback formula itself is fully readable in the application code, so every input's effect on the estimate is still traceable, just not as a SHAP decomposition.")
 
     cases = find_relevant_cases(event)
     st.markdown("#### Relevant historical decisions")
@@ -1074,6 +1283,43 @@ with tab_learning:
             st.altair_chart(chart, use_container_width=True)
         except Exception:
             st.dataframe(mix, use_container_width=True, hide_index=True)
+        st.markdown("#### Trust calibration: manager agreement with AI-generated scenarios")
+        st.caption("Each scenario raised by the system is an implicit recommendation. Approving it counts as agreement, rejecting it as "
+                   "disagreement; deferrals are excluded as undecided. This is a simple, auditable proxy for trust and decision "
+                   "confidence, not a measured psychological construct.")
+        agreement = compute_agreement_stats(st.session_state.decision_history)
+        if agreement["n_decided"] == 0:
+            st.info("No approved or rejected decisions yet — approve or reject a scenario to start building this signal.")
+        else:
+            ag1, ag2 = st.columns(2)
+            ag1.metric("Overall agreement rate", f"{agreement['overall_rate']*100:.0f}%",
+                       help="Approved decisions as a share of all approved + rejected decisions (deferrals excluded).")
+            ag2.metric("Decisions counted", agreement["n_decided"])
+            if not agreement["by_severity"].empty:
+                st.markdown("###### By scenario severity")
+                try:
+                    import altair as alt
+                    sev_chart = alt.Chart(agreement["by_severity"]).mark_bar().encode(
+                        x=alt.X("Agreement rate:Q", title="Agreement rate", axis=alt.Axis(format="%")),
+                        y=alt.Y("Severity:N", sort=["Critical", "Warning", "Info"], title="Severity"),
+                        tooltip=["Severity", "Decisions", alt.Tooltip("Agreement rate:Q", format=".0%")],
+                    )
+                    st.altair_chart(sev_chart, use_container_width=True)
+                except Exception:
+                    st.dataframe(agreement["by_severity"], use_container_width=True, hide_index=True)
+            if len(agreement["rolling"]) >= 2:
+                st.markdown("###### Agreement rate over time")
+                try:
+                    import altair as alt
+                    roll_chart = alt.Chart(agreement["rolling"]).mark_line(point=True).encode(
+                        x=alt.X("Decision #:Q", title="Decision sequence (chronological)"),
+                        y=alt.Y("Cumulative agreement rate:Q", title="Cumulative agreement rate", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, 1])),
+                        tooltip=["Decision #", alt.Tooltip("Cumulative agreement rate:Q", format=".0%")],
+                    )
+                    st.altair_chart(roll_chart, use_container_width=True)
+                except Exception:
+                    st.dataframe(agreement["rolling"], use_container_width=True, hide_index=True)
+
         st.markdown("#### Case library")
         cols = ["decision_at", "template", "category", "decision", "delta_demand_units_at_review", "delta_gross_profit_eur_at_review", "ai_assessment", "ai_assessment_signal", "ai_assessment_rationale", "note"]
         hist_view = hist[[c for c in cols if c in hist.columns]].copy()
@@ -1268,10 +1514,21 @@ with tab_model:
         st.dataframe(importance[["Feature label", "Importance"]].round(4), use_container_width=True, hide_index=True)
     st.dataframe(importance[["Feature label", "Importance"]].round(4), use_container_width=True, hide_index=True)
 
-    st.markdown("#### Local feature contribution proxy")
+    st.markdown("#### Local explanation: real SHAP values")
     selected_explain_category = st.selectbox("Category for explanation", list(CATEGORIES), key="explain_category")
     explain_profile = current_profile(selected_explain_category)
     baseline_profile = st.session_state.base_profiles[selected_explain_category]
+    shap_df = compute_shap_contributions(explain_profile)
+    if shap_df is not None:
+        render_shap_chart(shap_df, key_prefix="model_tab")
+        with st.expander("View SHAP contributions as a table"):
+            st.dataframe(shap_df[["Feature label", "Value", "SHAP contribution (units/day)"]].round(3),
+                         use_container_width=True, hide_index=True)
+    else:
+        st.warning("SHAP is not available for the current model (either the `shap` package failed to load, or the transparent formula fallback is active instead of XGBoost). "
+                   "The directional heuristic below remains available as a lower-fidelity substitute.")
+
+    st.markdown("#### Local feature contribution proxy (heuristic, shown for comparison)")
     contributions = []
     for feature in FEATURES:
         current_value = float(explain_profile[feature])
@@ -1289,8 +1546,15 @@ with tab_model:
     impact_df = impact_df.sort_values("Absolute contribution proxy", ascending=False)
     st.dataframe(impact_df[["Feature label", "Current value", "Baseline value", "Input delta", "Directional contribution proxy", "Absolute contribution proxy"]],
                  use_container_width=True, hide_index=True)
-    st.caption("SHAP is optional and installed if available, but this screen deliberately labels the local table as a directional heuristic. It is not a SHAP explanation. For rigorous SHAP values, validate the model, background data, and explainer configuration before use.")
+    st.caption("This simplified heuristic (signed input delta from baseline) is kept here deliberately, alongside the real SHAP values above, "
+               "so the difference between a naive directional proxy and an actual model-derived explanation is visible rather than hidden. "
+               "It is not a SHAP explanation and should not be presented as one.")
 
 # Footer
 st.divider()
-st.caption("Prototype limitations: synthetic data only; no real retailer feeds, orders, pricing, staffing, or compliance actions. Decisions, manager notes, and scenarios are held in the current Streamlit session and are not persisted to a database. Forecasts are exploratory and require validation before operational use.")
+_persist_note = ("Decision records are appended to a local file on this deployment instance, so they survive a page refresh or a second browser tab, "
+                  "but this is not a managed database and the file can still be reset on a redeploy or on some hosting platforms with ephemeral storage."
+                  if PERSISTENCE_AVAILABLE else
+                  "File-based persistence is unavailable in this environment, so decisions, manager notes, and scenarios are held only in the current Streamlit session.")
+st.caption(f"Prototype limitations: synthetic data only; no real retailer feeds, orders, pricing, staffing, or compliance actions. {_persist_note} "
+           "Forecasts are exploratory and require validation before operational use.")
