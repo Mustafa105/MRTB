@@ -134,6 +134,12 @@ st.markdown("""
 [role="dialog"] [data-testid="stCaptionContainer"], [role="dialog"] [data-testid="stCaptionContainer"] p,
 [data-testid="stDialog"] small, [role="dialog"] small { color: var(--text-color) !important; opacity: 1 !important; }
 [role="dialog"] button[kind="primary"] { background: #6254c7 !important; border-color: #6254c7 !important; color: #fff !important; border-radius: 10px; font-weight: 650; }
+/* spacing between the mini tabs inside pages and dialogs (covers old and new Streamlit tab markup) */
+[data-baseweb="tab-list"], [role="tablist"] { gap: .6rem !important; border-bottom: 1px solid rgba(120,120,150,.18); }
+[data-testid="stTab"], button[role="tab"] { padding: .6rem 1.25rem !important; margin: 0 .2rem !important; font-weight: 600 !important; white-space: nowrap; border-radius: 10px 10px 0 0; }
+[data-testid="stTab"][aria-selected="true"], button[role="tab"][aria-selected="true"],
+[data-testid="stTab"][aria-selected="true"] p, button[role="tab"][aria-selected="true"] p { color: #6254c7 !important; }
+.react-aria-SelectionIndicator, [data-baseweb="tab-highlight"] { background-color: #6254c7 !important; height: 3px !important; }
 #vg-tooltip-element:not(.visible) { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
